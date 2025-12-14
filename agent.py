@@ -46,9 +46,24 @@ BANNER = r"""
 └───────────────────────────────────────────────────────────────┘
 """
 
+# Constants
+MAX_CELL_PREVIEW = 12
+MAX_TEXT_LENGTH = 240
+OUTPUT_PREVIEW_LINES = 6
+CHAT_HISTORY_LIMIT = 10
+LOG_DISPLAY_LIMIT = 20
+TAIL_LINES = 40
+DEFAULT_TIMEOUT = 600
+GPU_DETECT_TIMEOUT = 3
+
 
 @dataclass
 class AgentSettings:
+    """Configuration settings for the LLM agent.
+
+    Loads settings from environment variables with sensible defaults.
+    Supports multiple providers: mistral, openai, ollama, lmstudio.
+    """
     provider: str = field(default_factory=lambda: os.getenv("AGENT_PROVIDER", "mistral"))
     model: str = field(default_factory=lambda: os.getenv("AGENT_MODEL", os.getenv("MISTRAL_MODEL", "mistral-large-latest")))
     api_key: str = field(default_factory=lambda: os.getenv("MISTRAL_API_KEY", os.getenv("OPENAI_API_KEY", "")))
@@ -78,6 +93,11 @@ class AgentSettings:
 
 
 class LLMClient:
+    """Client wrapper for various LLM providers.
+
+    Supports Mistral, OpenAI, Ollama, and LM Studio providers.
+    Handles API initialization and chat completions.
+    """
     def __init__(self, settings: AgentSettings):
         self.settings = settings
         provider = settings.provider
@@ -85,20 +105,41 @@ class LLMClient:
 
         if provider == "mistral":
             if Mistral is None:
-                raise RuntimeError("mistralai package is missing. Install deps with `pip install -r requirements.txt`.")
+                raise RuntimeError(
+                    "mistralai package is missing. Install dependencies with: "
+                    "pip install -r requirements.txt"
+                )
             if not settings.api_key:
-                raise RuntimeError("Set MISTRAL_API_KEY for provider mistral.")
+                raise RuntimeError(
+                    "MISTRAL_API_KEY is required for Mistral provider. "
+                    "Set it via environment variable or use /setkey command."
+                )
             self.client = Mistral(api_key=settings.api_key, server_url=settings.base_url)
         else:
             if OpenAI is None:
-                raise RuntimeError("openai package is missing. Install deps with `pip install -r requirements.txt`.")
+                raise RuntimeError(
+                    "openai package is missing. Install dependencies with: "
+                    "pip install -r requirements.txt"
+                )
             if provider == "openai" and not settings.api_key:
-                raise RuntimeError("Set OPENAI_API_KEY (or MISTRAL_API_KEY if reused) for provider openai.")
+                raise RuntimeError(
+                    "OPENAI_API_KEY is required for OpenAI provider. "
+                    "Set it via environment variable or use /setkey command."
+                )
             # local providers may not require a key; supply a dummy
             api_key = settings.api_key or "not-needed"
             self.client = OpenAI(api_key=api_key, base_url=settings.base_url)
 
     def chat(self, messages: List[Dict[str, str]], **kwargs: Any) -> str:
+        """Send a chat completion request to the LLM provider.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys
+            **kwargs: Additional provider-specific parameters
+
+        Returns:
+            The assistant's response content as a string
+        """
         if self.provider == "mistral":
             response = self.client.chat.complete(  # type: ignore[attr-defined]
                 model=self.settings.model,
@@ -118,6 +159,11 @@ class LLMClient:
 
 
 class NotebookManager:
+    """Manages notebook execution, logging, and file operations.
+
+    Handles notebook reading, execution via nbclient, and log management.
+    Stores execution artifacts in .notebook_agent directory.
+    """
     def __init__(self, workdir: Path):
         self.workdir = workdir
         self.state_dir = self.workdir / ".notebook_agent"
@@ -131,19 +177,29 @@ class NotebookManager:
         return datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
 
     def read(self, notebook_path: Path) -> str:
+        """Read and summarize a notebook's structure and content."""
         nb = nbformat.read(notebook_path, as_version=4)
         summary_lines = [f"# Cells: {len(nb.cells)}", ""]
-        for idx, cell in enumerate(nb.cells[:12]):  # trim output
+        for idx, cell in enumerate(nb.cells[:MAX_CELL_PREVIEW]):
             label = f"{idx+1:02d} {cell.cell_type.upper()}"
             body = cell.source.strip()
-            if len(body) > 240:
-                body = body[:240] + "... [truncated]"
+            if len(body) > MAX_TEXT_LENGTH:
+                body = body[:MAX_TEXT_LENGTH] + "... [truncated]"
             summary_lines.append(f"{label}\n{body}\n")
-        if len(nb.cells) > 12:
-            summary_lines.append(f"... (+{len(nb.cells) - 12} more cells)")
+        if len(nb.cells) > MAX_CELL_PREVIEW:
+            summary_lines.append(f"... (+{len(nb.cells) - MAX_CELL_PREVIEW} more cells)")
         return "\n".join(summary_lines)
 
     def run(self, notebook_path: Path, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Execute a Jupyter notebook and capture outputs and logs.
+
+        Args:
+            notebook_path: Path to the notebook file to execute
+            timeout: Optional timeout in seconds (defaults to DEFAULT_TIMEOUT)
+
+        Returns:
+            Dict containing run_id, status, log_path, executed_path, error, and output_preview
+        """
         nb = nbformat.read(notebook_path, as_version=4)
         run_id = f"{self._timestamp()}_{notebook_path.stem}"
         run_log = self.raw_log_dir / f"{run_id}.log"
@@ -155,7 +211,7 @@ class NotebookManager:
             kernel_name = nb.metadata.get("kernelspec", {}).get("name") or "python3"
             client = NotebookClient(
                 nb,
-                timeout=timeout or 600,
+                timeout=timeout or DEFAULT_TIMEOUT,
                 kernel_name=kernel_name,
                 resources={"metadata": {"path": str(notebook_path.parent)}},
             )
@@ -178,12 +234,17 @@ class NotebookManager:
         except CellExecutionError as err:
             nbformat.write(nb, executed_path)
             status = "failed"
-            error = str(err)
+            error = f"Cell execution failed: {err}"
+            stdout_lines.append(error)
+        except (OSError, IOError) as err:
+            nbformat.write(nb, executed_path)
+            status = "failed"
+            error = f"File I/O error: {err}"
             stdout_lines.append(error)
         except Exception as err:  # noqa: BLE001
             nbformat.write(nb, executed_path)
             status = "failed"
-            error = str(err)
+            error = f"Unexpected error: {err}"
             stdout_lines.append(error)
 
         run_log.write_text("\n".join(stdout_lines), encoding="utf-8")
@@ -193,7 +254,7 @@ class NotebookManager:
             "log_path": run_log,
             "executed_path": executed_path,
             "error": error,
-            "output_preview": stdout_lines[-6:],
+            "output_preview": stdout_lines[-OUTPUT_PREVIEW_LINES:],
         }
 
     def list_logs(self) -> List[Path]:
@@ -208,20 +269,37 @@ class NotebookManager:
 
 
 class NotebookGenerator:
+    """Generates and edits Jupyter notebooks using LLM assistance.
+
+    Uses prompt-based generation to create or modify notebook content.
+    Handles JSON extraction from LLM responses and provides fallback handling.
+    """
     def __init__(self, llm: LLMClient):
         self.llm = llm
 
     def _extract_json(self, text: str) -> Optional[str]:
+        """Extract JSON content from LLM response.
+
+        Tries to find JSON in markdown code fences first, then validates raw text.
+        """
         fenced = re.findall(r"```json(.*?)```", text, re.DOTALL)
         if fenced:
             return fenced[0]
         try:
             json.loads(text)
             return text
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             return None
 
     def generate(self, prompt: str) -> nbformat.NotebookNode:
+        """Generate a new notebook from a text prompt.
+
+        Args:
+            prompt: Description of the notebook to generate
+
+        Returns:
+            A NotebookNode object representing the generated notebook
+        """
         system = (
             "You are an autonomous notebook builder. "
             "Return a valid Jupyter nbformat v4 JSON. "
@@ -236,13 +314,23 @@ class NotebookGenerator:
         extracted = self._extract_json(raw) or raw
         try:
             return nbformat.reads(extracted, as_version=4)
-        except Exception:
+        except (json.JSONDecodeError, nbformat.ValidationError) as err:
             # fallback: simple notebook with content as markdown
+            console.print(f"[yellow]Warning: Could not parse LLM response as notebook ({err}). Using fallback.[/yellow]")
             nb = nbformat.v4.new_notebook()
             nb.cells.append(nbformat.v4.new_markdown_cell(f"Autogenerated notebook placeholder.\n\n{raw}"))
             return nb
 
     def edit(self, notebook_text: str, instruction: str) -> nbformat.NotebookNode:
+        """Edit an existing notebook based on an instruction.
+
+        Args:
+            notebook_text: JSON string of the notebook to edit
+            instruction: Description of changes to make
+
+        Returns:
+            Updated NotebookNode object
+        """
         system = (
             "You are a notebook editor. Update the provided Jupyter notebook JSON according to the instruction. "
             "Return the full updated nbformat v4 JSON. Keep outputs empty."
@@ -279,29 +367,44 @@ def format_sysinfo() -> str:
 
 
 def detect_gpu() -> Optional[str]:
+    """Attempt to detect GPU information using system commands.
+
+    Returns:
+        GPU information string if detected, None otherwise
+    """
     cmds = [
         ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
         ["system_profiler", "SPDisplaysDataType"],
     ]
     for cmd in cmds:
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=3)
+            out = subprocess.check_output(
+                cmd,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=GPU_DETECT_TIMEOUT
+            )
             cleaned = " ".join(out.strip().split())
             if cleaned:
-                return cleaned[:240]
-        except Exception:
+                return cleaned[:MAX_TEXT_LENGTH]
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
             continue
     return None
 
 
 class ChatLoop:
+    """Interactive chat interface for notebook management.
+
+    Provides slash commands for notebook generation, execution, editing,
+    and log management. Maintains conversation history for LLM context.
+    """
     def __init__(self, settings: AgentSettings, llm: Optional[LLMClient], manager: NotebookManager):
         self.settings = settings
         self.llm = llm
         self.manager = manager
         self.mode = "author"  # author | autonomy
         self.history: List[Dict[str, str]] = []
-        self.default_timeout = 600
+        self.default_timeout = DEFAULT_TIMEOUT
         self.last_run: Optional[Dict[str, Any]] = None
         self.slash_commands = [
             "/help",
@@ -492,7 +595,7 @@ class ChatLoop:
             console.print("No logs yet.")
             return
         table = Table("log", "modified")
-        for log in logs[-20:]:
+        for log in logs[-LOG_DISPLAY_LIMIT:]:
             mtime = datetime.fromtimestamp(log.stat().st_mtime).isoformat(timespec="seconds")
             table.add_row(str(log), mtime)
         console.print(table)
@@ -510,7 +613,7 @@ class ChatLoop:
             console.print(f"Log not found: {path}")
             return
         lines = self.manager.read_log(path).splitlines()
-        tail = "\n".join(lines[-40:])
+        tail = "\n".join(lines[-TAIL_LINES:])
         console.print(tail)
 
     def _handle_list(self) -> None:
@@ -557,7 +660,7 @@ class ChatLoop:
             f"Current mode: {self.mode}."
         )
         self.history.append({"role": "user", "content": text})
-        messages = [{"role": "system", "content": system}] + self.history[-10:]
+        messages = [{"role": "system", "content": system}] + self.history[-CHAT_HISTORY_LIMIT:]
         reply = self.llm.chat(messages)
         self.history.append({"role": "assistant", "content": reply})
         console.print(reply)
@@ -680,9 +783,37 @@ class ChatLoop:
 
 
 def slugify(text: str) -> str:
+    """Convert text to a safe filename slug.
+
+    Args:
+        text: Input text to slugify
+
+    Returns:
+        Lowercase string with only alphanumeric characters and hyphens
+    """
     text = text.lower().strip()
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
+
+
+def validate_path(path: Path, workdir: Path) -> bool:
+    """Validate that a path is safe and within the working directory.
+
+    Args:
+        path: Path to validate
+        workdir: Working directory to check against
+
+    Returns:
+        True if path is safe, False otherwise
+    """
+    try:
+        # Resolve to absolute path and check if it's within workdir
+        resolved = path.resolve()
+        workdir_resolved = workdir.resolve()
+        # Check if path is within workdir (prevents directory traversal)
+        return resolved == workdir_resolved or workdir_resolved in resolved.parents
+    except (ValueError, OSError):
+        return False
 
 
 def load_env() -> None:
@@ -765,4 +896,3 @@ def new(prompt: str) -> None:
 
 if __name__ == "__main__":
     app()
-ENV_FILE = Path(".env")
