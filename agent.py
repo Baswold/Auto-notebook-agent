@@ -17,8 +17,12 @@ import typer
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError
 from rich.console import Console
-from rich.prompt import Prompt
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.syntax import Syntax
+from rich.markdown import Markdown
 
 try:
     from openai import OpenAI
@@ -41,9 +45,18 @@ console = Console()
 app = typer.Typer(help="Notebook agent CLI with LLM-assisted authoring and execution.")
 ENV_FILE = Path(".env")
 BANNER = r"""
-┌───────────────────────────────────────────────────────────────┐
-│   JUPYTER NOTEBOOK AGENT — build/run/edit/log notebooks fast   │
-└───────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════╗
+║                                                                  ║
+║    ███╗   ██╗ ██████╗ ████████╗███████╗██████╗  ██████╗  ██████╗ ██╗  ██╗    ║
+║    ████╗  ██║██╔═══██╗╚══██╔══╝██╔════╝██╔══██╗██╔═══██╗██╔═══██╗██║ ██╔╝    ║
+║    ██╔██╗ ██║██║   ██║   ██║   █████╗  ██████╔╝██║   ██║██║   ██║█████╔╝     ║
+║    ██║╚██╗██║██║   ██║   ██║   ██╔══╝  ██╔══██╗██║   ██║██║   ██║██╔═██╗     ║
+║    ██║ ╚████║╚██████╔╝   ██║   ███████╗██████╔╝╚██████╔╝╚██████╔╝██║  ██╗    ║
+║    ╚═╝  ╚═══╝ ╚═════╝    ╚═╝   ╚══════╝╚═════╝  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝    ║
+║                                                                  ║
+║           AI-Powered Jupyter Notebook Agent & Automation         ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
 # Constants
@@ -130,32 +143,40 @@ class LLMClient:
             api_key = settings.api_key or "not-needed"
             self.client = OpenAI(api_key=api_key, base_url=settings.base_url)
 
-    def chat(self, messages: List[Dict[str, str]], **kwargs: Any) -> str:
+    def chat(self, messages: List[Dict[str, str]], show_spinner: bool = True, **kwargs: Any) -> str:
         """Send a chat completion request to the LLM provider.
 
         Args:
             messages: List of message dicts with 'role' and 'content' keys
+            show_spinner: Whether to show a progress spinner during the request
             **kwargs: Additional provider-specific parameters
 
         Returns:
             The assistant's response content as a string
         """
-        if self.provider == "mistral":
-            response = self.client.chat.complete(  # type: ignore[attr-defined]
-                model=self.settings.model,
-                messages=messages,
-                temperature=self.settings.temperature,
-                **kwargs,
-            )
-            return response.choices[0].message.content or ""
+        def _make_request() -> str:
+            if self.provider == "mistral":
+                response = self.client.chat.complete(  # type: ignore[attr-defined]
+                    model=self.settings.model,
+                    messages=messages,
+                    temperature=self.settings.temperature,
+                    **kwargs,
+                )
+                return response.choices[0].message.content or ""
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.settings.model,
+                    messages=messages,
+                    temperature=self.settings.temperature,
+                    **kwargs,
+                )
+                return response.choices[0].message.content or ""
+
+        if show_spinner:
+            with console.status(f"[bold cyan]Thinking with {self.settings.model}...[/bold cyan]", spinner="dots"):
+                return _make_request()
         else:
-            response = self.client.chat.completions.create(
-                model=self.settings.model,
-                messages=messages,
-                temperature=self.settings.temperature,
-                **kwargs,
-            )
-            return response.choices[0].message.content or ""
+            return _make_request()
 
 
 class NotebookManager:
@@ -205,18 +226,26 @@ class NotebookManager:
         run_log = self.raw_log_dir / f"{run_id}.log"
         executed_path = self.run_log_dir / f"{run_id}.ipynb"
 
-        console.print(f"[bold green]Executing[/bold green] {notebook_path} (run id {run_id})")
+        console.print(Panel(
+            f"[bold cyan]Executing notebook:[/bold cyan] {notebook_path}\n"
+            f"[dim]Run ID:[/dim] {run_id}\n"
+            f"[dim]Timeout:[/dim] {timeout or DEFAULT_TIMEOUT}s",
+            title="[bold green]Notebook Execution[/bold green]",
+            border_style="green"
+        ))
         stdout_lines: List[str] = []
         try:
             kernel_name = nb.metadata.get("kernelspec", {}).get("name") or "python3"
-            client = NotebookClient(
-                nb,
-                timeout=timeout or DEFAULT_TIMEOUT,
-                kernel_name=kernel_name,
-                resources={"metadata": {"path": str(notebook_path.parent)}},
-            )
-            client.execute()
-            nbformat.write(client.nb, executed_path)
+
+            with console.status(f"[bold yellow]Running {len(nb.cells)} cells with kernel '{kernel_name}'...[/bold yellow]", spinner="bouncingBar"):
+                client = NotebookClient(
+                    nb,
+                    timeout=timeout or DEFAULT_TIMEOUT,
+                    kernel_name=kernel_name,
+                    resources={"metadata": {"path": str(notebook_path.parent)}},
+                )
+                client.execute()
+                nbformat.write(client.nb, executed_path)
             # collect outputs for a quick summary
             for cell in client.nb.cells:
                 if cell.cell_type != "code":
@@ -344,26 +373,48 @@ class NotebookGenerator:
         return nbformat.reads(extracted, as_version=4)
 
 
-def format_sysinfo() -> str:
-    info: List[str] = []
-    info.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
-    info.append(f"Python: {sys.version.split()[0]}")
+def format_sysinfo() -> None:
+    """Display system information in a formatted table."""
+    table = Table(title="[bold cyan]System Information[/bold cyan]", show_header=True, header_style="bold magenta")
+    table.add_column("Component", style="cyan", no_wrap=True)
+    table.add_column("Details", style="white")
+
+    # OS Info
+    table.add_row("Operating System", f"{platform.system()} {platform.release()} ({platform.machine()})")
+    table.add_row("Python Version", sys.version.split()[0])
+
+    # RAM Info
     try:
         vm = psutil.virtual_memory()
-        info.append(f"RAM: {vm.total/1e9:0.1f} GB total, {vm.available/1e9:0.1f} GB available")
+        ram_used_pct = vm.percent
+        ram_color = "green" if ram_used_pct < 70 else "yellow" if ram_used_pct < 90 else "red"
+        table.add_row(
+            "Memory",
+            f"[{ram_color}]{vm.total/1e9:0.1f} GB total, {vm.available/1e9:0.1f} GB available ({100-ram_used_pct:.1f}% free)[/{ram_color}]"
+        )
     except Exception:
-        info.append("RAM: unavailable (psutil error)")
+        table.add_row("Memory", "[red]unavailable[/red]")
+
+    # Disk Info
     try:
         disk = shutil.disk_usage(".")
-        info.append(f"Disk: {disk.free/1e9:0.1f} GB free of {disk.total/1e9:0.1f} GB")
+        disk_used_pct = (disk.used / disk.total) * 100
+        disk_color = "green" if disk_used_pct < 70 else "yellow" if disk_used_pct < 90 else "red"
+        table.add_row(
+            "Disk Space",
+            f"[{disk_color}]{disk.free/1e9:0.1f} GB free of {disk.total/1e9:0.1f} GB ({100-disk_used_pct:.1f}% free)[/{disk_color}]"
+        )
     except Exception:
-        info.append("Disk: unavailable")
+        table.add_row("Disk Space", "[red]unavailable[/red]")
+
+    # GPU Info
     gpu_info = detect_gpu()
     if gpu_info:
-        info.append(f"GPU: {gpu_info}")
+        table.add_row("GPU", f"[green]{gpu_info}[/green]")
     else:
-        info.append("GPU: none detected")
-    return "\n".join(info)
+        table.add_row("GPU", "[dim]none detected[/dim]")
+
+    console.print(table)
 
 
 def detect_gpu() -> Optional[str]:
@@ -429,33 +480,51 @@ class ChatLoop:
             "/exit",
         ]
 
-    def help_text(self) -> str:
-        return (
-            "Slash commands:\n"
-            "  /mode [author|autonomy]   switch interaction style\n"
-            "  /new <prompt>             generate a notebook from a prompt\n"
-            "  /auto <experiment>        generate + execute notebook\n"
-            "  /run <path>               execute an existing notebook\n"
-            "  /read <path>              summarize a notebook\n"
-            "  /edit <path> <instruction>edit notebook via LLM\n"
-            "  /logs                     list recent run logs\n"
-            "  /log <path>               read a specific log file\n"
-            "  /tail <path>              print last lines of a log file\n"
-            "  /list                     list notebooks in cwd\n"
-            "  /timeout [seconds]        view/set default execution timeout\n"
-            "  /last                     show last run summary\n"
-            "  /env                      show provider/model/base URL (keys masked)\n"
-            "  /sysinfo                  show system resources\n"
-            "  /provider <name>          switch LLM provider (mistral|ollama|lmstudio|openai)\n"
-            "  /model <name>             set LLM model id\n"
-            "  /baseurl <url>            set API base URL\n"
-            "  /setkey                   prompt for API key (for mistral/openai) and save to .env\n"
-            "  /exit                     quit\n"
-        )
+    def help_text(self) -> None:
+        """Display formatted help text with command categories."""
+        help_content = """
+[bold cyan]NOTEBOOK OPERATIONS[/bold cyan]
+  [green]/new[/green] <prompt>              Generate a notebook from a prompt
+  [green]/auto[/green] <experiment>         Generate and execute notebook automatically
+  [green]/run[/green] <path>                Execute an existing notebook
+  [green]/read[/green] <path>               Summarize a notebook's structure
+  [green]/edit[/green] <path> <instruction> Edit notebook via LLM
+  [green]/list[/green]                      List notebooks in current directory
+
+[bold cyan]LOG MANAGEMENT[/bold cyan]
+  [green]/logs[/green]                      List recent run logs
+  [green]/log[/green] <path>                Read a specific log file
+  [green]/tail[/green] <path>               Print last lines of a log file
+  [green]/last[/green]                      Show last run summary
+
+[bold cyan]CONFIGURATION[/bold cyan]
+  [green]/mode[/green] [author|autonomy]    Switch interaction style
+  [green]/timeout[/green] [seconds]         View/set default execution timeout
+  [green]/provider[/green] <name>           Switch LLM provider (mistral|ollama|lmstudio|openai)
+  [green]/model[/green] <name>              Set LLM model id
+  [green]/baseurl[/green] <url>             Set API base URL
+  [green]/setkey[/green]                    Prompt for API key and save to .env
+  [green]/env[/green]                       Show current configuration (keys masked)
+
+[bold cyan]SYSTEM INFO[/bold cyan]
+  [green]/sysinfo[/green]                   Show system resources (RAM, disk, GPU)
+  [green]/help[/green]                      Show this help message
+  [green]/exit[/green]                      Quit the application
+"""
+        console.print(Panel(help_content, title="[bold yellow]Available Commands[/bold yellow]", border_style="cyan"))
 
     def run(self) -> None:
-        console.print(f"[cyan]{BANNER}[/cyan]")
-        console.print("[bold cyan]Notebook agent[/bold cyan]. Type a prompt or /help for commands.")
+        console.print(f"[bold magenta]{BANNER}[/bold magenta]")
+        console.print(Panel(
+            "[bold white]Welcome to the Notebook Agent![/bold white]\n\n"
+            "• Generate notebooks from natural language prompts\n"
+            "• Execute and monitor notebook runs\n"
+            "• Edit notebooks with AI assistance\n"
+            "• Manage logs and outputs\n\n"
+            "[dim]Type a prompt to chat or /help for available commands[/dim]",
+            title=f"[bold cyan]Agent Mode: {self.mode.upper()}[/bold cyan]",
+            border_style="cyan"
+        ))
         while True:
             try:
                 text = self._input()
@@ -524,24 +593,44 @@ class ChatLoop:
     def _handle_mode(self, text: str) -> None:
         parts = text.split()
         if len(parts) == 1:
-            console.print(f"Current mode: {self.mode}")
+            console.print(Panel(
+                f"[bold cyan]Current mode:[/bold cyan] {self.mode.upper()}\n\n"
+                f"[dim]Available modes: author, autonomy[/dim]",
+                title="[bold]Agent Mode[/bold]",
+                border_style="cyan"
+            ))
             return
         choice = parts[1].lower()
         if choice not in {"author", "autonomy"}:
-            console.print("Mode must be author|autonomy")
+            console.print("[red]Mode must be 'author' or 'autonomy'[/red]")
             return
         self.mode = choice
-        console.print(f"Mode set to {self.mode}")
+        console.print(f"[green]✓ Mode set to[/green] [bold]{self.mode.upper()}[/bold]")
 
     def _handle_new(self, prompt: str) -> None:
         if not self.llm:
-            console.print("LLM client is unavailable. Set MISTRAL_API_KEY and restart.")
+            console.print("[red]LLM client is unavailable. Set MISTRAL_API_KEY and restart.[/red]")
             return
+
+        console.print(Panel(
+            f"[cyan]Generating notebook from:[/cyan]\n{prompt}",
+            title="[bold yellow]Notebook Generation[/bold yellow]",
+            border_style="yellow"
+        ))
+
         generator = NotebookGenerator(self.llm)
         nb = generator.generate(prompt)
         target = Path(f"{slugify(prompt) or 'notebook'}_{int(time.time())}.ipynb")
         self.manager.write_notebook(nb, target)
-        console.print(f"Notebook written to {target}")
+
+        console.print(Panel(
+            f"[green]✓ Notebook created successfully![/green]\n\n"
+            f"[cyan]File:[/cyan] {target}\n"
+            f"[cyan]Cells:[/cyan] {len(nb.cells)}\n"
+            f"[dim]Use /run {target} to execute[/dim]",
+            title="[bold green]Generation Complete[/bold green]",
+            border_style="green"
+        ))
 
     def _handle_auto(self, prompt: str) -> None:
         if not self.llm:
@@ -575,19 +664,38 @@ class ChatLoop:
 
     def _handle_edit(self, path_text: str, instruction: str) -> None:
         if not self.llm:
-            console.print("LLM client is unavailable. Set MISTRAL_API_KEY and restart.")
+            console.print("[red]LLM client is unavailable. Set MISTRAL_API_KEY and restart.[/red]")
             return
         path = Path(path_text)
         if not path.exists():
-            console.print(f"Notebook not found: {path}")
+            console.print(f"[yellow]Notebook not found:[/yellow] {path}")
             return
+
+        # Show confirmation prompt
+        console.print(Panel(
+            f"[yellow]You are about to edit:[/yellow] {path}\n"
+            f"[yellow]Instruction:[/yellow] {instruction}\n\n"
+            f"[dim]A backup will be saved to {path.with_suffix('.bak.ipynb')}[/dim]",
+            title="[bold yellow]Confirm Edit[/bold yellow]",
+            border_style="yellow"
+        ))
+
+        if not Confirm.ask("[bold]Proceed with edit?[/bold]", default=True):
+            console.print("[yellow]Edit cancelled.[/yellow]")
+            return
+
         raw_text = path.read_text(encoding="utf-8")
         generator = NotebookGenerator(self.llm)
         nb = generator.edit(raw_text, instruction)
         backup = path.with_suffix(".bak.ipynb")
         shutil.copy(path, backup)
         self.manager.write_notebook(nb, path)
-        console.print(f"Updated {path} (backup at {backup})")
+        console.print(Panel(
+            f"[green]✓ Successfully updated {path}[/green]\n"
+            f"[dim]Backup saved to {backup}[/dim]",
+            title="[bold green]Edit Complete[/bold green]",
+            border_style="green"
+        ))
 
     def _handle_logs(self) -> None:
         logs = self.manager.list_logs()
@@ -648,10 +756,20 @@ class ChatLoop:
         self._print_run_result(self.last_run)
 
     def _handle_env(self) -> None:
-        masked_key = "****" if self.settings.api_key else "(none)"
-        console.print(
-            f"provider={self.settings.provider}, model={self.settings.model}, base_url={self.settings.base_url}, api_key={masked_key}, timeout={self.default_timeout}s"
-        )
+        masked_key = "****" if self.settings.api_key else "[red](not set)[/red]"
+
+        table = Table(title="[bold cyan]Configuration[/bold cyan]", show_header=True, header_style="bold magenta")
+        table.add_column("Setting", style="cyan", no_wrap=True)
+        table.add_column("Value", style="white")
+
+        table.add_row("Provider", self.settings.provider)
+        table.add_row("Model", self.settings.model)
+        table.add_row("Base URL", self.settings.base_url)
+        table.add_row("API Key", masked_key)
+        table.add_row("Default Timeout", f"{self.default_timeout}s")
+        table.add_row("Mode", self.mode)
+
+        console.print(table)
 
     def _chat(self, text: str) -> None:
         system = (
@@ -666,15 +784,31 @@ class ChatLoop:
         console.print(reply)
 
     def _print_run_result(self, result: Dict[str, Any]) -> None:
+        """Display formatted execution result with rich styling."""
         self.last_run = result
-        console.print(f"Status: [bold]{result['status']}[/bold]")
-        console.print(f"Executed notebook: {result['executed_path']}")
-        console.print(f"Log: {result['log_path']}")
+        status = result['status']
+
+        if status == "success":
+            status_text = "[bold green]✓ SUCCESS[/bold green]"
+            border_style = "green"
+        else:
+            status_text = "[bold red]✗ FAILED[/bold red]"
+            border_style = "red"
+
+        content = f"{status_text}\n\n"
+        content += f"[cyan]Executed notebook:[/cyan] {result['executed_path']}\n"
+        content += f"[cyan]Log file:[/cyan] {result['log_path']}\n"
+
         if result.get("output_preview"):
-            console.print("Output tail:")
-            console.print("\n".join(result["output_preview"]))
+            content += "\n[bold]Output Preview:[/bold]\n"
+            output_lines = result["output_preview"]
+            for line in output_lines:
+                content += f"[dim]{line}[/dim]\n"
+
         if result.get("error"):
-            console.print(f"[red]Error:[/red] {result['error']}")
+            content += f"\n[bold red]Error Details:[/bold red]\n{result['error']}"
+
+        console.print(Panel(content, title="[bold]Execution Result[/bold]", border_style=border_style))
 
     def _input(self) -> str:
         if pt_prompt and WordCompleter:
@@ -687,24 +821,40 @@ class ChatLoop:
     def _handle_provider(self, text: str) -> None:
         parts = text.split()
         if len(parts) == 1:
-            console.print(f"Current provider: {self.settings.provider}")
+            console.print(Panel(
+                f"[bold cyan]Current provider:[/bold cyan] {self.settings.provider}\n\n"
+                f"[dim]Available providers: mistral, ollama, lmstudio, openai[/dim]",
+                title="[bold]LLM Provider[/bold]",
+                border_style="cyan"
+            ))
             return
         choice = parts[1].lower()
         if choice not in {"mistral", "ollama", "lmstudio", "openai"}:
-            console.print("Provider must be mistral|ollama|lmstudio|openai")
+            console.print("[red]Provider must be: mistral, ollama, lmstudio, or openai[/red]")
             return
         self.settings.provider = choice
         self._rebuild_llm()
-        console.print(f"Provider set to {choice}. Model: {self.settings.model}, base_url: {self.settings.base_url}")
+        console.print(Panel(
+            f"[green]✓ Provider changed to[/green] [bold]{choice}[/bold]\n\n"
+            f"[cyan]Model:[/cyan] {self.settings.model}\n"
+            f"[cyan]Base URL:[/cyan] {self.settings.base_url}",
+            title="[bold green]Provider Updated[/bold green]",
+            border_style="green"
+        ))
 
     def _handle_model(self, text: str) -> None:
         parts = text.split(maxsplit=1)
         if len(parts) == 1:
-            console.print(f"Current model: {self.settings.model}")
+            console.print(Panel(
+                f"[bold cyan]Current model:[/bold cyan] {self.settings.model}\n\n"
+                f"[cyan]Provider:[/cyan] {self.settings.provider}",
+                title="[bold]LLM Model[/bold]",
+                border_style="cyan"
+            ))
             return
         self.settings.model = parts[1].strip()
         self._rebuild_llm()
-        console.print(f"Model set to {self.settings.model}")
+        console.print(f"[green]✓ Model set to[/green] [bold]{self.settings.model}[/bold]")
 
     def _handle_baseurl(self, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -716,9 +866,16 @@ class ChatLoop:
         console.print(f"Base URL set to {self.settings.base_url}")
 
     def _handle_setkey(self) -> None:
-        key = Prompt.ask("Enter API key", password=True)
+        console.print(Panel(
+            f"[cyan]Setting API key for provider:[/cyan] [bold]{self.settings.provider}[/bold]\n\n"
+            f"[dim]The key will be saved to .env file[/dim]",
+            title="[bold yellow]API Key Setup[/bold yellow]",
+            border_style="yellow"
+        ))
+
+        key = Prompt.ask("[bold]Enter API key[/bold]", password=True)
         if not key:
-            console.print("Key unchanged.")
+            console.print("[yellow]Key unchanged.[/yellow]")
             return
         if self.settings.provider == "mistral":
             self.settings.api_key = key
@@ -730,7 +887,14 @@ class ChatLoop:
             self.settings.api_key = key
             save_env_value("AGENT_API_KEY", key)
         self._rebuild_llm()
-        console.print("API key saved to .env and client refreshed.")
+        console.print(Panel(
+            "[green]✓ API key saved successfully![/green]\n\n"
+            f"[dim]Saved to: .env\n"
+            f"Provider: {self.settings.provider}\n"
+            f"Client status: {'✓ Ready' if self.llm else '✗ Failed'}[/dim]",
+            title="[bold green]Key Saved[/bold green]",
+            border_style="green"
+        ))
 
     def _rebuild_llm(self) -> None:
         try:
@@ -753,7 +917,13 @@ class ChatLoop:
                 if "!" in src or "%%bash" in src or "pip install" in src:
                     suspicious.append(src.strip().splitlines()[0] if src else "")
             if suspicious:
-                console.print("[yellow]Warning:[/yellow] notebook includes shell/pip commands; review before execution.")
+                warning_text = "[bold yellow]This notebook contains shell or pip commands:[/bold yellow]\n\n"
+                for cmd in suspicious[:5]:  # Show max 5 examples
+                    warning_text += f"  • [dim]{cmd[:60]}...[/dim]\n" if len(cmd) > 60 else f"  • [dim]{cmd}[/dim]\n"
+                if len(suspicious) > 5:
+                    warning_text += f"\n[dim]... and {len(suspicious) - 5} more[/dim]\n"
+                warning_text += "\n[yellow]Please review these commands before execution.[/yellow]"
+                console.print(Panel(warning_text, title="[bold yellow]⚠ Security Warning[/bold yellow]", border_style="yellow"))
         except Exception:
             return
 
@@ -852,12 +1022,27 @@ def chat() -> None:
         settings = AgentSettings()
         llm = LLMClient(settings)
     except Exception as err:  # noqa: BLE001
-        console.print(f"[red]LLM unavailable:[/red] {err}")
+        console.print(Panel(
+            f"[yellow]⚠ LLM client initialization failed[/yellow]\n\n"
+            f"[red]Error:[/red] {err}\n\n"
+            f"[dim]You can still use the CLI, but LLM features will be unavailable.\n"
+            f"Use /setkey to configure your API key.[/dim]",
+            title="[bold yellow]Warning[/bold yellow]",
+            border_style="yellow"
+        ))
         llm = None
     manager = NotebookManager(Path(".").resolve())
-    console.print(f"[dim]LLM provider: {settings.provider}, model: {settings.model}, base_url: {settings.base_url}[/dim]")
-    if settings.provider == "mistral" and not settings.api_key:
-        console.print("[yellow]MISTRAL_API_KEY missing. Use /setkey to provide it.[/yellow]")
+
+    # Show initial configuration
+    status_text = f"[cyan]Provider:[/cyan] {settings.provider}\n"
+    status_text += f"[cyan]Model:[/cyan] {settings.model}\n"
+    status_text += f"[cyan]Status:[/cyan] {'[green]✓ Ready[/green]' if llm else '[yellow]⚠ Not configured[/yellow]'}"
+
+    console.print(Panel(status_text, title="[bold]Configuration[/bold]", border_style="blue"))
+
+    if settings.provider in {"mistral", "openai"} and not settings.api_key:
+        console.print("[yellow]💡 Tip: Use /setkey to configure your API key[/yellow]\n")
+
     loop = ChatLoop(settings, llm, manager)
     loop.run()
 
