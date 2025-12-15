@@ -540,7 +540,9 @@ class ChatLoop:
                 continue
             if text.startswith("/"):
                 if text in ("/help", "/h"):
-                    console.print(self.help_text())
+                    self.help_text()
+                elif text.startswith("/model"):
+                    self._handle_model(text)
                 elif text.startswith("/mode"):
                     self._handle_mode(text)
                 elif text.startswith("/new "):
@@ -572,11 +574,9 @@ class ChatLoop:
                 elif text.startswith("/env"):
                     self._handle_env()
                 elif text.startswith("/sysinfo"):
-                    console.print(format_sysinfo())
+                    format_sysinfo()
                 elif text.startswith("/provider"):
                     self._handle_provider(text)
-                elif text.startswith("/model"):
-                    self._handle_model(text)
                 elif text.startswith("/baseurl"):
                     self._handle_baseurl(text)
                 elif text.startswith("/setkey"):
