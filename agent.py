@@ -42,7 +42,11 @@ except Exception:
     WordCompleter = None  # type: ignore
 
 console = Console()
-app = typer.Typer(help="Notebook agent CLI with LLM-assisted authoring and execution.")
+app = typer.Typer(
+    help="Notebook agent CLI with LLM-assisted authoring and execution.",
+    invoke_without_command=True,
+    no_args_is_help=False
+)
 ENV_FILE = Path(".env")
 BANNER = r"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -1013,6 +1017,20 @@ def save_env_value(key: str, value: str) -> None:
     if not found:
         lines.append(f"{key}={value}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@app.callback()
+def main(ctx: typer.Context) -> None:
+    """
+    Notebook Agent - AI-powered Jupyter notebook automation.
+
+    Run without arguments to start interactive chat mode.
+    Use subcommands for specific operations.
+    """
+    # If no subcommand was provided, start chat mode
+    if ctx.invoked_subcommand is None:
+        chat()
+
 
 @app.command()
 def chat() -> None:
