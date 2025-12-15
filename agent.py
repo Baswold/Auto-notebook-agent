@@ -37,9 +37,11 @@ except Exception:
 try:
     from prompt_toolkit import prompt as pt_prompt
     from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.patch_stdout import patch_stdout
 except Exception:
     pt_prompt = None  # type: ignore
     WordCompleter = None  # type: ignore
+    patch_stdout = None  # type: ignore
 
 console = Console()
 app = typer.Typer(
@@ -73,6 +75,113 @@ TAIL_LINES = 40
 DEFAULT_TIMEOUT = 600
 GPU_DETECT_TIMEOUT = 3
 
+# Model lists for each provider
+PROVIDER_MODELS = {
+    "mistral": [
+        # Latest General Purpose Models
+        "mistral-large-latest",
+        "mistral-medium-latest",
+        "mistral-small-latest",
+        # Code Generation Models (Codestral)
+        "codestral-latest",
+        # Devstral 2 Models (December 2025) - Coding-specialized models
+        "devstral-small-latest",     # Devstral Small 2 (24B) - DEFAULT
+        "labs-devstral-small-2512",  # Devstral Small 2 (24B) - explicit version
+    ],
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+    ],
+    "ollama": [
+        "llama2",
+        "llama3.2",
+        "mistral",
+        "neural-chat",
+        "qwen2.5-coder:7b",
+    ],
+    "lmstudio": [
+        "local-model",  # Placeholder - actual models depend on what's loaded
+    ],
+}
+
+# Tool definitions for Mistral function calling
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_notebook",
+            "description": "Create a new Jupyter notebook from a text prompt describing what the notebook should contain",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed description of the notebook to create (what code/markdown cells it should have)"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_notebook",
+            "description": "Read and summarize the structure and content of an existing notebook",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the notebook file to read (must be a .ipynb file)"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_notebook",
+            "description": "Modify an existing notebook by adding, removing, or changing cells based on instructions",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the notebook file to edit"
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "Detailed instruction for what changes to make to the notebook"
+                    }
+                },
+                "required": ["path", "instruction"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_notebook",
+            "description": "Execute a Jupyter notebook and return the results, outputs, and any errors",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the notebook file to run"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    }
+]
+
 
 @dataclass
 class AgentSettings:
@@ -82,7 +191,7 @@ class AgentSettings:
     Supports multiple providers: mistral, openai, ollama, lmstudio.
     """
     provider: str = field(default_factory=lambda: os.getenv("AGENT_PROVIDER", "mistral"))
-    model: str = field(default_factory=lambda: os.getenv("AGENT_MODEL", os.getenv("MISTRAL_MODEL", "mistral-large-latest")))
+    model: str = field(default_factory=lambda: os.getenv("AGENT_MODEL", os.getenv("MISTRAL_MODEL", "devstral-small-latest")))
     api_key: str = field(default_factory=lambda: os.getenv("MISTRAL_API_KEY", os.getenv("OPENAI_API_KEY", "")))
     base_url: str = field(default_factory=lambda: os.getenv("AGENT_BASE_URL", os.getenv("MISTRAL_BASE_URL", "")))
     temperature: float = 0.1
@@ -90,15 +199,16 @@ class AgentSettings:
     def __post_init__(self) -> None:
         # normalize provider and fill sensible defaults
         self.provider = self.provider.lower()
+        # Only set default base_url for non-Mistral providers
+        # Mistral SDK has proper defaults, and explicit URLs break Devstral models
         if not self.base_url:
-            if self.provider == "mistral":
-                self.base_url = "https://api.mistral.ai/v1"
-            elif self.provider == "openai":
+            if self.provider == "openai":
                 self.base_url = "https://api.openai.com/v1"
             elif self.provider == "ollama":
                 self.base_url = "http://localhost:11434/v1"
             elif self.provider == "lmstudio":
                 self.base_url = "http://localhost:1234/v1"
+            # For Mistral: leave base_url empty to use SDK defaults
         # fallback model hints per provider if user did not override
         if not self.model:
             if self.provider in {"ollama", "lmstudio"}:
@@ -106,7 +216,7 @@ class AgentSettings:
             elif self.provider == "openai":
                 self.model = "gpt-4o-mini"
             else:
-                self.model = "mistral-large-latest"
+                self.model = "devstral-small-latest"
 
 
 class LLMClient:
@@ -131,7 +241,11 @@ class LLMClient:
                     "MISTRAL_API_KEY is required for Mistral provider. "
                     "Set it via environment variable or use /setkey command."
                 )
-            self.client = Mistral(api_key=settings.api_key, server_url=settings.base_url)
+            # Only pass server_url if explicitly set (needed for Devstral models)
+            if settings.base_url:
+                self.client = Mistral(api_key=settings.api_key, server_url=settings.base_url)
+            else:
+                self.client = Mistral(api_key=settings.api_key)
         else:
             if OpenAI is None:
                 raise RuntimeError(
@@ -147,34 +261,113 @@ class LLMClient:
             api_key = settings.api_key or "not-needed"
             self.client = OpenAI(api_key=api_key, base_url=settings.base_url)
 
-    def chat(self, messages: List[Dict[str, str]], show_spinner: bool = True, **kwargs: Any) -> str:
+        # Initialize notebook generator for tool calling
+        self.notebook_gen = NotebookGenerator(self)
+
+    def chat(self, messages: List[Dict[str, str]], show_spinner: bool = True, tools: Optional[Any] = None, tool_callback: Optional[Any] = None, **kwargs: Any) -> str:
         """Send a chat completion request to the LLM provider.
 
         Args:
             messages: List of message dicts with 'role' and 'content' keys
             show_spinner: Whether to show a progress spinner during the request
+            tools: Optional list of tool definitions for function calling
+            tool_callback: Optional callback function for handling tool calls - signature: (name: str, args: dict) -> str
             **kwargs: Additional provider-specific parameters
 
         Returns:
             The assistant's response content as a string
         """
         def _make_request() -> str:
-            if self.provider == "mistral":
-                response = self.client.chat.complete(  # type: ignore[attr-defined]
-                    model=self.settings.model,
-                    messages=messages,
-                    temperature=self.settings.temperature,
-                    **kwargs,
-                )
-                return response.choices[0].message.content or ""
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.settings.model,
-                    messages=messages,
-                    temperature=self.settings.temperature,
-                    **kwargs,
-                )
-                return response.choices[0].message.content or ""
+            # Working copy of messages to allow multiple turns for tool calling
+            current_messages = [msg.copy() for msg in messages]
+            max_tool_iterations = 5  # Reduced to prevent excessive looping
+            tool_calls_made = 0
+            max_tool_calls = 2  # Stop after 2 successful tool executions
+
+            iteration = 0
+            while iteration < max_tool_iterations:
+                iteration += 1
+                if iteration > 1:
+                    console.print(f"[dim]  [Iteration {iteration}/{max_tool_iterations}][/dim]")
+
+                if self.provider == "mistral":
+                    request_kwargs = {
+                        "model": self.settings.model,
+                        "messages": current_messages,
+                        "temperature": self.settings.temperature,
+                    }
+                    if tools:
+                        request_kwargs["tools"] = tools
+                    request_kwargs.update(kwargs)
+
+                    response = self.client.chat.complete(**request_kwargs)  # type: ignore[attr-defined]
+                    message = response.choices[0].message
+
+                    # Check for tool calls
+                    has_tool_calls = hasattr(message, "tool_calls") and message.tool_calls
+                    if has_tool_calls and tool_callback:
+                        # Append the assistant's response with tool calls
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": message.content or ""
+                        }
+                        # Add tool_calls in Mistral format if present
+                        if message.tool_calls:
+                            assistant_msg["tool_calls"] = [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                }
+                                for tc in message.tool_calls
+                            ]
+                        current_messages.append(assistant_msg)
+
+                        # Execute each tool call and append results
+                        for tool_call in message.tool_calls:
+                            try:
+                                args = json.loads(tool_call.function.arguments)
+                                result = tool_callback(tool_call.function.name, args)
+                                tool_calls_made += 1
+                                current_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": str(result)
+                                })
+                            except Exception as e:
+                                current_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": f"Error: {str(e)}"
+                                })
+
+                        # If we've made enough tool calls, get a final response and return
+                        if tool_calls_made >= max_tool_calls:
+                            # Make one final request for summary
+                            request_kwargs["messages"] = current_messages
+                            response = self.client.chat.complete(**request_kwargs)  # type: ignore[attr-defined]
+                            return response.choices[0].message.content or "✓ Tools executed successfully"
+
+                        # Otherwise continue for more tool calls
+                        continue
+                    else:
+                        # No tool calls requested, return the response
+                        return message.content or ""
+                else:
+                    # For non-Mistral providers, use basic chat (no tool support)
+                    response = self.client.chat.completions.create(
+                        model=self.settings.model,
+                        messages=current_messages,
+                        temperature=self.settings.temperature,
+                        **kwargs,
+                    )
+                    return response.choices[0].message.content or ""
+
+            # If we hit max iterations, return with a warning
+            return f"(Warning: Reached maximum tool iterations ({max_tool_iterations}))"
 
         if show_spinner:
             with console.status(f"[bold cyan]Thinking with {self.settings.model}...[/bold cyan]", spinner="dots"):
@@ -447,6 +640,319 @@ def detect_gpu() -> Optional[str]:
     return None
 
 
+def select_from_list(options: List[str], title: str = "Select an option") -> Optional[str]:
+    """Interactive menu to select from a list using arrow keys.
+
+    Formats items in columns based on terminal width. Supports:
+    - Arrow keys (↑/↓) to navigate
+    - Enter to select
+    - Esc or q to cancel
+
+    Args:
+        options: List of options to choose from
+        title: Title for the selection menu
+
+    Returns:
+        Selected option or None if cancelled
+    """
+    if not options:
+        console.print("[red]No options available[/red]")
+        return None
+
+    import sys
+
+    # Check if we can use interactive mode (need a real TTY)
+    try:
+        is_tty = sys.stdin.isatty()
+    except Exception:
+        is_tty = False
+
+    # Use numbered list if not in a TTY environment
+    if not is_tty:
+        console.print(f"[bold]{title}[/bold]")
+        for i, option in enumerate(options, 1):
+            console.print(f"  {i}. {option}")
+        try:
+            choice = Prompt.ask("Select", choices=[str(i) for i in range(1, len(options) + 1)])
+            return options[int(choice) - 1]
+        except (ValueError, IndexError):
+            return None
+
+    # Use arrow key selection for TTY
+    try:
+        from termios import tcgetattr, tcsetattr, TCSADRAIN
+        from tty import setraw
+
+        selected_index = [0]
+
+        def get_display_text() -> str:
+            """Build the display text for the menu, formatted in columns."""
+            # Get terminal width
+            try:
+                import shutil
+                term_width = shutil.get_terminal_size((80, 20)).columns
+            except Exception:
+                term_width = 80
+
+            lines = [f"[bold cyan]{title}[/bold cyan]\n"]
+            lines.append("[dim](↑/↓ navigate, Enter select, Esc/q cancel)[/dim]\n")
+
+            # Calculate column width and number of columns
+            max_option_len = max(len(opt) for opt in options) + 4  # +4 for "→ " and padding
+            num_cols = max(1, term_width // max_option_len)
+
+            # Build items in rows
+            items_per_row = max(1, (len(options) + num_cols - 1) // num_cols)
+
+            for row in range(items_per_row):
+                row_items = []
+                for col in range(num_cols):
+                    idx = row + col * items_per_row
+                    if idx < len(options):
+                        option = options[idx]
+                        if idx == selected_index[0]:
+                            item = f"[bold green]→ {option}[/bold green]"
+                        else:
+                            item = f"  {option}"
+                        row_items.append(item)
+
+                if row_items:
+                    lines.append("  ".join(row_items))
+
+            return "\n".join(lines)
+
+        # Display initial menu
+        console.print(get_display_text())
+
+        # Save terminal settings
+        old_settings = tcgetattr(sys.stdin)
+        try:
+            setraw(sys.stdin.fileno())
+            while True:
+                # Clear and redraw
+                console.clear()
+                console.print(get_display_text())
+
+                # Read single character
+                ch = sys.stdin.read(1)
+                if not ch:
+                    continue
+
+                # Handle escape sequences (arrow keys) and direct input
+                if ch == '\x1b':  # ESC or arrow key
+                    next_ch = sys.stdin.read(1)
+                    if next_ch == '[':
+                        arrow = sys.stdin.read(1)
+                        if arrow == 'A':  # Up arrow
+                            selected_index[0] = (selected_index[0] - 1) % len(options)
+                        elif arrow == 'B':  # Down arrow
+                            selected_index[0] = (selected_index[0] + 1) % len(options)
+                    else:
+                        # Escape key pressed (next_ch is something else)
+                        return None
+                elif ch == '\r':  # Enter
+                    return options[selected_index[0]]
+                elif ch.lower() == 'q':  # Quick exit
+                    return None
+        finally:
+            # Restore terminal settings
+            try:
+                tcsetattr(sys.stdin, TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+    except Exception:
+        # Fallback to numbered list on any error
+        console.print(f"[bold]{title}[/bold]")
+        for i, option in enumerate(options, 1):
+            console.print(f"  {i}. {option}")
+        try:
+            choice = Prompt.ask("Select", choices=[str(i) for i in range(1, len(options) + 1)])
+            return options[int(choice) - 1]
+        except (ValueError, IndexError):
+            return None
+
+    return None
+
+
+class NotebookAgent:
+    """Autonomous agent that uses Devstral Small 2 to plan and execute notebook tasks.
+
+    The agent runs in a loop where the LLM decides what to do next (create, edit, run notebooks)
+    and the agent executes those decisions. Similar to Claude Code's agent architecture.
+    """
+    def __init__(self, settings: AgentSettings, llm: LLMClient, manager: NotebookManager):
+        self.settings = settings
+        self.llm = llm
+        self.manager = manager
+        self.max_iterations = 15  # Agent typically finishes in 3-7 iterations
+        self.iteration = 0
+        self.actions_taken: List[Dict[str, Any]] = []
+
+    def run(self, goal: str) -> str:
+        """Run the agent to achieve the given goal.
+
+        Args:
+            goal: The task/goal for the agent to accomplish
+
+        Returns:
+            Final result message from the agent
+        """
+        console.print(f"\n[bold cyan]🤖 Agent Starting[/bold cyan]")
+        console.print(f"[cyan]Goal: {goal}[/cyan]\n")
+
+        self.iteration = 0
+        self.actions_taken = []
+
+        while self.iteration < self.max_iterations:
+            self.iteration += 1
+            console.print(f"[dim]─ Iteration {self.iteration}/{self.max_iterations} ─[/dim]")
+
+            # If we've taken actions and are on iteration 4+, assume we're done
+            # (agent tends to get stuck in parsing loops after completing work)
+            if self.actions_taken and self.iteration >= 4:
+                return f"✓ Goal completed\n\nActions executed:\n" + \
+                       "\n".join([f"  {i+1}. {a['tool']}" for i, a in enumerate(self.actions_taken)])
+
+            # Step 1: Agent thinks about what to do
+            action = self._think(goal)
+
+            if action is None:
+                # If we can't parse the response and have already taken actions, consider it done
+                if self.actions_taken:
+                    return f"✓ Goal completed\n\nActions executed:\n" + \
+                           "\n".join([f"  {i+1}. {a['tool']}" for i, a in enumerate(self.actions_taken)])
+                else:
+                    return "❌ Failed to parse agent response"
+
+            # Step 2: Execute the action
+            if action["type"] == "tool_call":
+                result = self._execute_tool(action["tool"], action.get("args", {}))
+                self.actions_taken.append({
+                    "iteration": self.iteration,
+                    "tool": action["tool"],
+                    "args": action.get("args", {}),
+                    "result": result
+                })
+                console.print(f"[green]✓ Tool executed: {action['tool']}[/green]")
+
+            elif action["type"] == "complete":
+                console.print(f"\n[bold green]✓ Agent Complete[/bold green]")
+                console.print(f"[green]{action['result']}[/green]\n")
+                return action["result"]
+
+            elif action["type"] == "error":
+                console.print(f"\n[bold red]✗ Agent Error[/bold red]")
+                console.print(f"[red]{action['message']}[/red]\n")
+                return f"Error: {action['message']}"
+
+            console.print()
+
+        console.print(f"\n[bold yellow]⚠ Max iterations ({self.max_iterations}) reached[/bold yellow]\n")
+        return "Agent reached maximum iterations without completing the goal"
+
+    def _think(self, goal: str) -> Optional[Dict[str, Any]]:
+        """Have the agent think about what to do next.
+
+        Returns a dict with:
+        {
+            "type": "tool_call" | "complete" | "error",
+            "tool": tool_name,  # if type == "tool_call"
+            "args": {...},      # if type == "tool_call"
+            "result": "...",    # if type == "complete"
+            "message": "..."    # if type == "error"
+        }
+        """
+        system = (
+            "You are an autonomous agent that creates, edits, and runs Jupyter notebooks.\n\n"
+            "Available tools:\n"
+            "- create_notebook(prompt): Create a new Jupyter notebook\n"
+            "- edit_notebook(path, instruction): Edit an existing notebook\n"
+            "- read_notebook(path): Read and summarize a notebook\n"
+            "- run_notebook(path): Execute a notebook\n\n"
+            "You MUST respond with ONLY a valid JSON object. No other text.\n"
+            "Response format:\n"
+            '{"type": "tool_call", "tool": "create_notebook", "args": {"prompt": "..."}}\n'
+            'OR\n'
+            '{"type": "complete", "result": "Success message describing what was done"}\n'
+            'OR\n'
+            '{"type": "error", "message": "Error message"}\n\n'
+            "Think step-by-step about the goal and what action to take next."
+        )
+
+        # Build context about what we've done so far
+        history_text = ""
+        if self.actions_taken:
+            history_text = "\nActions taken so far:\n"
+            for i, action in enumerate(self.actions_taken, 1):
+                history_text += f"{i}. Called {action['tool']} → {action['result'][:100]}\n"
+
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": f"Goal: {goal}{history_text}\n\nWhat is the next action?"
+            }
+        ]
+
+        # Get LLM response
+        response = self.llm.chat(messages, show_spinner=False)
+
+        # Parse the response as JSON
+        try:
+            action = json.loads(response)
+            return action
+        except json.JSONDecodeError:
+            # If response isn't JSON, it's likely the agent is done and explaining the result
+            # Treat it as completion
+            if len(response) > 10:  # Make sure it's not just noise
+                return {"type": "complete", "result": response}
+            else:
+                # Very short response, probably needs another iteration
+                return None
+
+    def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Execute a tool and return the result as a string."""
+        try:
+            if tool_name == "create_notebook":
+                prompt = args.get("prompt", "")
+                nb = self.llm.notebook_gen.generate(prompt)
+                timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                nb_path = Path.cwd() / f"notebook_{timestamp}.ipynb"
+                nbformat.write(nb, nb_path)
+                return f"✓ Created notebook: {nb_path.name} ({len(nb.cells)} cells)"
+
+            elif tool_name == "read_notebook":
+                path = args.get("path", "")
+                if not path:
+                    return "❌ Error: path argument required"
+                summary = self.manager.read(Path(path))
+                return f"✓ Notebook summary:\n{summary}"
+
+            elif tool_name == "edit_notebook":
+                path = args.get("path", "")
+                instruction = args.get("instruction", "")
+                if not path or not instruction:
+                    return "❌ Error: path and instruction arguments required"
+                edited_nb = self.llm.notebook_gen.edit(path, instruction)
+                nbformat.write(edited_nb, path)
+                return f"✓ Edited notebook: {path} ({len(edited_nb.cells)} cells)"
+
+            elif tool_name == "run_notebook":
+                path = args.get("path", "")
+                if not path:
+                    return "❌ Error: path argument required"
+                result = self.manager.run(Path(path), timeout=DEFAULT_TIMEOUT)
+                status = "✓ SUCCESS" if result["status"] == "success" else "❌ FAILED"
+                return f"{status}: {path}\n{result.get('output_preview', 'No output')}"
+
+            else:
+                return f"❌ Unknown tool: {tool_name}"
+
+        except Exception as e:
+            return f"❌ Tool error: {str(e)}"
+
+
 class ChatLoop:
     """Interactive chat interface for notebook management.
 
@@ -588,11 +1094,11 @@ class ChatLoop:
                     console.print("Unknown command. /help to list.")
                 continue
 
-            # regular chat
+            # Run agent for regular prompts
             if not self.llm:
                 console.print("LLM client is unavailable. Set MISTRAL_API_KEY and restart.")
                 continue
-            self._chat(text)
+            self._run_agent(text)
 
     def _handle_mode(self, text: str) -> None:
         parts = text.split()
@@ -775,15 +1281,85 @@ class ChatLoop:
 
         console.print(table)
 
+    def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+        """Execute a tool function and return the result as a string.
+
+        Args:
+            tool_name: Name of the tool to execute
+            tool_args: Arguments to pass to the tool
+
+        Returns:
+            String representation of the tool result
+        """
+        console.print(f"[bold yellow]→ Tool called: {tool_name}[/bold yellow]")
+        try:
+            if tool_name == "create_notebook":
+                prompt = tool_args.get("prompt", "")
+                console.print(f"[dim]  Prompt: {prompt[:60]}...[/dim]")
+                nb = self.llm.notebook_gen.generate(prompt)
+                # Auto-save to file
+                timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                nb_path = Path.cwd() / f"notebook_{timestamp}.ipynb"
+                nbformat.write(nb, nb_path)
+                result = f"✓ Created and saved notebook to: {nb_path} (with {len(nb.cells)} cells)"
+                console.print(f"[bold green]{result}[/bold green]")
+                return result
+
+            elif tool_name == "read_notebook":
+                path = tool_args.get("path", "")
+                console.print(f"\n[bold cyan]Reading notebook: {path}[/bold cyan]")
+                summary = self.manager.read(Path(path))
+                return summary
+
+            elif tool_name == "edit_notebook":
+                path = tool_args.get("path", "")
+                instruction = tool_args.get("instruction", "")
+                console.print(f"\n[bold cyan]Editing notebook: {path}[/bold cyan]")
+                edited_nb = self.llm.notebook_gen.edit(path, instruction)
+                # Auto-save the edited notebook
+                nbformat.write(edited_nb, path)
+                return f"Notebook edited and saved to: {path}"
+
+            elif tool_name == "run_notebook":
+                path = tool_args.get("path", "")
+                console.print(f"\n[bold cyan]Running notebook: {path}[/bold cyan]")
+                result = self.manager.run(Path(path), timeout=self.default_timeout)
+                status_str = "✓ SUCCESS" if result["status"] == "success" else "✗ FAILED"
+                output = f"{status_str}\n"
+                if result.get("output_preview"):
+                    output += f"Output: {result['output_preview']}\n"
+                if result.get("error"):
+                    output += f"Error: {result['error']}\n"
+                output += f"Executed: {result['executed_path']}\nLogs: {result['log_path']}"
+                return output
+
+            else:
+                return f"Unknown tool: {tool_name}"
+
+        except Exception as e:
+            return f"Error executing {tool_name}: {str(e)}"
+
+    def _run_agent(self, goal: str) -> None:
+        """Run the autonomous agent with the given goal."""
+        notebook_agent = NotebookAgent(self.settings, self.llm, self.manager)
+        result = notebook_agent.run(goal)
+        console.print()
+
     def _chat(self, text: str) -> None:
         system = (
-            "You are a concise AI coding partner inside a notebook automation CLI. "
-            "Keep responses short. Do not execute code yourself; propose notebook changes when asked. "
-            f"Current mode: {self.mode}."
+            "You are a helpful AI coding assistant in a notebook automation CLI. "
+            "You can answer questions, provide code suggestions, and help with notebook workflows.\n\n"
+            "For autonomous notebook creation and management, users should use the 'agent' command instead.\n"
+            "For example: agent 'Create a notebook that calculates fibonacci'\n\n"
+            f"Current mode: {self.mode}. Keep responses concise and helpful."
         )
         self.history.append({"role": "user", "content": text})
         messages = [{"role": "system", "content": system}] + self.history[-CHAT_HISTORY_LIMIT:]
+
+        # Simple chat - no tool calling in the chat interface
+        # For autonomous tool usage, users should use: python3 agent.py agent "goal"
         reply = self.llm.chat(messages)
+
         self.history.append({"role": "assistant", "content": reply})
         console.print(reply)
 
@@ -824,14 +1400,27 @@ class ChatLoop:
 
     def _handle_provider(self, text: str) -> None:
         parts = text.split()
+
+        # If no arguments, show interactive provider selector
         if len(parts) == 1:
-            console.print(Panel(
-                f"[bold cyan]Current provider:[/bold cyan] {self.settings.provider}\n\n"
-                f"[dim]Available providers: mistral, ollama, lmstudio, openai[/dim]",
-                title="[bold]LLM Provider[/bold]",
-                border_style="cyan"
-            ))
+            providers = list(PROVIDER_MODELS.keys())
+            selected = select_from_list(
+                providers,
+                title="Select LLM Provider"
+            )
+            if selected:
+                self.settings.provider = selected
+                self._rebuild_llm()
+                console.print(Panel(
+                    f"[green]✓ Provider changed to[/green] [bold]{selected}[/bold]\n\n"
+                    f"[cyan]Model:[/cyan] {self.settings.model}\n"
+                    f"[cyan]Base URL:[/cyan] {self.settings.base_url}",
+                    title="[bold green]Provider Updated[/bold green]",
+                    border_style="green"
+                ))
             return
+
+        # If argument provided, set directly
         choice = parts[1].lower()
         if choice not in {"mistral", "ollama", "lmstudio", "openai"}:
             console.print("[red]Provider must be: mistral, ollama, lmstudio, or openai[/red]")
@@ -848,14 +1437,25 @@ class ChatLoop:
 
     def _handle_model(self, text: str) -> None:
         parts = text.split(maxsplit=1)
+
+        # If no arguments, show interactive model selector
         if len(parts) == 1:
-            console.print(Panel(
-                f"[bold cyan]Current model:[/bold cyan] {self.settings.model}\n\n"
-                f"[cyan]Provider:[/cyan] {self.settings.provider}",
-                title="[bold]LLM Model[/bold]",
-                border_style="cyan"
-            ))
+            models = PROVIDER_MODELS.get(self.settings.provider, [])
+            if not models:
+                console.print(f"[red]No models available for provider: {self.settings.provider}[/red]")
+                return
+
+            selected = select_from_list(
+                models,
+                title=f"Select model for {self.settings.provider.upper()}"
+            )
+            if selected:
+                self.settings.model = selected
+                self._rebuild_llm()
+                console.print(f"[green]✓ Model set to[/green] [bold]{self.settings.model}[/bold]")
             return
+
+        # If argument provided, set directly
         self.settings.model = parts[1].strip()
         self._rebuild_llm()
         console.print(f"[green]✓ Model set to[/green] [bold]{self.settings.model}[/bold]")
